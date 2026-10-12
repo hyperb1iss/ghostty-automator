@@ -434,6 +434,10 @@ pub const Application = extern struct {
     pub fn deinit(self: *Self) void {
         const alloc = self.allocator();
         const priv: *Private = self.private();
+        if (priv.ipc_server) |server| {
+            priv.ipc_server = null;
+            server.deinit();
+        }
         priv.config.unref();
         priv.winproto.deinit(alloc);
         priv.global_shortcuts.unref();
@@ -1450,7 +1454,11 @@ pub const Application = extern struct {
         const priv = self.private();
         const alloc = priv.core_app.alloc;
 
-        priv.ipc_server = IpcServer.init(alloc, self, null) catch |err| {
+        const instance = if (priv.config.get().class) |class|
+            if (gio.Application.idIsValid(class) != 0) class else null
+        else
+            null;
+        priv.ipc_server = IpcServer.init(alloc, self, instance) catch |err| {
             log.warn("IPC server initialization failed: {}", .{err});
             return;
         };

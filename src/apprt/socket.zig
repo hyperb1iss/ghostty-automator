@@ -14,6 +14,13 @@ const builtin = @import("builtin");
 const Allocator = std.mem.Allocator;
 const posix = std.posix;
 
+const Darwin = struct {
+    extern "c" fn confstr(name: c_int, buffer: ?[*]u8, len: usize) usize;
+    extern "c" fn getpeereid(fd: posix.socket_t, uid: *posix.uid_t, gid: *posix.gid_t) c_int;
+    // Darwin's <unistd.h> canonical per-user temporary directory selector.
+    const user_temp_dir: c_int = 65537;
+};
+
 const ipc = @import("ipc.zig");
 
 const log = std.log.scoped(.ipc_socket);
@@ -218,6 +225,18 @@ pub fn getSocketDir(alloc: Allocator) ![]u8 {
         else => posix.getuid(),
     };
 
+    if (builtin.os.tag == .macos) {
+        const length = Darwin.confstr(Darwin.user_temp_dir, null, 0);
+        if (length == 0) return error.UserTempDirectoryUnavailable;
+        const buffer = try alloc.alloc(u8, length);
+        defer alloc.free(buffer);
+        const result = Darwin.confstr(Darwin.user_temp_dir, buffer.ptr, buffer.len);
+        if (result == 0 or result > buffer.len) return error.UserTempDirectoryUnavailable;
+        const subdir = try std.fmt.allocPrint(alloc, "ghostty-automator-{d}", .{uid});
+        defer alloc.free(subdir);
+        return std.fs.path.join(alloc, &.{ buffer[0 .. result - 1], subdir });
+    }
+
     // Try XDG_RUNTIME_DIR first (Linux)
     if (builtin.os.tag == .linux) {
         if (std.posix.getenv("XDG_RUNTIME_DIR")) |runtime_dir| {
@@ -242,17 +261,18 @@ pub fn getSocketPath(alloc: Allocator, instance: ?[]const u8) ![]u8 {
     const dir = try getSocketDir(alloc);
     defer alloc.free(dir);
 
-    const filename = instance orelse default_socket_name;
-    const sock_filename = if (std.mem.endsWith(u8, filename, ".sock"))
-        try alloc.dupe(u8, filename)
+    // Instance names are identifiers, not filenames. Retaining a class's own
+    // suffix keeps e.g. com.example.agent and com.example.agent.sock distinct.
+    const sock_filename = if (instance) |name|
+        try std.fmt.allocPrint(alloc, "{s}.sock", .{name})
     else
-        try std.fmt.allocPrint(alloc, "{s}.sock", .{filename});
+        try alloc.dupe(u8, default_socket_name);
     defer alloc.free(sock_filename);
 
     return try std.fs.path.join(alloc, &.{ dir, sock_filename });
 }
 
-pub fn removeSocketFile(path: []const u8) (posix.FStatAtError || std.fs.DeleteFileError || SocketPathError)!void {
+pub fn removeSocketFile(path: []const u8) (posix.FStatAtError || std.fs.Dir.DeleteFileError || SocketPathError)!void {
     if (builtin.os.tag == .windows) return;
 
     const stat = posix.fstatat(
@@ -269,6 +289,14 @@ pub fn removeSocketFile(path: []const u8) (posix.FStatAtError || std.fs.DeleteFi
     }
 
     try std.fs.deleteFileAbsolute(path);
+}
+
+pub fn validateSocketDirectory(path: []const u8) !void {
+    const dir = std.fs.path.dirname(path) orelse return error.InvalidSocketDirectory;
+    const stat = try posix.fstatat(std.fs.cwd().fd, dir, posix.AT.SYMLINK_NOFOLLOW);
+    if (std.fs.File.Stat.fromPosix(stat).kind != .directory or
+        stat.uid != posix.getuid() or stat.mode & 0o077 != 0)
+        return error.UnsafeSocketDirectory;
 }
 
 pub fn validateRequestVersion(request: Request) SocketPathError!void {
@@ -395,8 +423,21 @@ pub const Client = struct {
     alloc: Allocator,
     socket: posix.socket_t,
     path: []u8,
+    timer: ?std.time.Timer = null,
+    timeout_ns: u64 = 0,
+
+    pub const Options = struct {
+        /// Suppress connection logs so callers can report structured errors.
+        quiet: bool = false,
+        /// Bound the entire connect/request/response, including partial reads.
+        timeout_ms: ?u32 = null,
+    };
 
     pub fn init(alloc: Allocator, target: ipc.Target) !Client {
+        return initWithOptions(alloc, target, .{});
+    }
+
+    pub fn initWithOptions(alloc: Allocator, target: ipc.Target, options: Options) !Client {
         // On macOS, the app bundle is generally single-instance, so we always
         // use the default socket path to avoid `--class` making IPC unusable.
         const instance_name: ?[]const u8 = switch (target) {
@@ -406,11 +447,13 @@ pub const Client = struct {
 
         const path = try getSocketPath(alloc, instance_name);
         errdefer alloc.free(path);
+        try validateSocketDirectory(path);
 
         // Create Unix domain socket
         const socket = try posix.socket(
             posix.AF.UNIX,
-            posix.SOCK.STREAM,
+            posix.SOCK.STREAM | posix.SOCK.CLOEXEC |
+                @as(u32, if (options.timeout_ms != null) posix.SOCK.NONBLOCK else 0),
             0,
         );
         errdefer posix.close(socket);
@@ -439,16 +482,74 @@ pub const Client = struct {
         @memset(&addr.path, 0);
         @memcpy(addr.path[0..path.len], path);
 
-        posix.connect(socket, @ptrCast(&addr), @sizeOf(posix.sockaddr.un)) catch |err| {
-            log.err("failed to connect to socket {s}: {}", .{ path, err });
-            return error.IPCFailed;
-        };
-
-        return .{
+        var client: Client = .{
             .alloc = alloc,
             .socket = socket,
             .path = path,
+            .timer = if (options.timeout_ms != null) try std.time.Timer.start() else null,
+            .timeout_ns = @as(u64, options.timeout_ms orelse 0) * std.time.ns_per_ms,
         };
+        posix.connect(socket, @ptrCast(&addr), @sizeOf(posix.sockaddr.un)) catch |err| {
+            if (err == error.WouldBlock and options.timeout_ms != null) {
+                try client.waitReady(posix.POLL.OUT);
+                try posix.getsockoptError(socket);
+            } else {
+                if (!options.quiet) {
+                    log.err("failed to connect to socket {s}: {}", .{ path, err });
+                    return error.IPCFailed;
+                }
+                return err;
+            }
+        };
+        if (builtin.os.tag == .linux) {
+            var credentials: extern struct { pid: i32, uid: u32, gid: u32 } = undefined;
+            try posix.getsockopt(socket, posix.SOL.SOCKET, posix.SO.PEERCRED, std.mem.asBytes(&credentials));
+            if (credentials.uid != posix.getuid()) return error.UntrustedSocketPeer;
+        } else if (builtin.os.tag.isDarwin()) {
+            var peer_uid: posix.uid_t = undefined;
+            var peer_gid: posix.gid_t = undefined;
+            if (Darwin.getpeereid(socket, &peer_uid, &peer_gid) != 0) return error.UntrustedSocketPeer;
+            if (peer_uid != posix.getuid()) return error.UntrustedSocketPeer;
+        }
+        return client;
+    }
+
+    fn waitReady(self: *Client, events: i16) !void {
+        const timer = if (self.timer) |*timer| timer else return;
+        const elapsed = timer.read();
+        if (elapsed >= self.timeout_ns) return error.IPCTimedOut;
+        const remaining_ms = std.math.divCeil(u64, self.timeout_ns - elapsed, std.time.ns_per_ms) catch unreachable;
+        var fds = [_]posix.pollfd{.{ .fd = self.socket, .events = events, .revents = 0 }};
+        if (try posix.poll(&fds, @intCast(@min(remaining_ms, std.math.maxInt(i32)))) == 0)
+            return error.IPCTimedOut;
+    }
+
+    fn write(self: *Client, buf: []const u8) !void {
+        if (self.timer == null) return writeAll(self.socket, buf);
+        var off: usize = 0;
+        while (off < buf.len) {
+            try self.waitReady(posix.POLL.OUT);
+            const n = posix.send(self.socket, buf[off..], posix.MSG.NOSIGNAL) catch |err| switch (err) {
+                error.WouldBlock => continue,
+                else => return err,
+            };
+            if (n == 0) return error.ConnectionClosed;
+            off += n;
+        }
+    }
+
+    fn read(self: *Client, buf: []u8) !void {
+        if (self.timer == null) return readExact(self.socket, buf);
+        var off: usize = 0;
+        while (off < buf.len) {
+            try self.waitReady(posix.POLL.IN);
+            const n = posix.recv(self.socket, buf[off..], 0) catch |err| switch (err) {
+                error.WouldBlock => continue,
+                else => return err,
+            };
+            if (n == 0) return error.ConnectionClosed;
+            off += n;
+        }
     }
 
     pub fn deinit(self: *Client) void {
@@ -465,12 +566,12 @@ pub const Client = struct {
         var len_bytes: [4]u8 = undefined;
         std.mem.writeInt(u32, &len_bytes, len, .little);
 
-        try writeAll(self.socket, len_bytes[0..]);
-        try writeAll(self.socket, request_json);
+        try self.write(len_bytes[0..]);
+        try self.write(request_json);
 
         // Receive response
         var resp_len_bytes: [4]u8 = undefined;
-        try readExact(self.socket, resp_len_bytes[0..]);
+        try self.read(resp_len_bytes[0..]);
         const resp_len = std.mem.readInt(u32, &resp_len_bytes, .little);
         if (resp_len > 16 * 1024 * 1024) { // 16MB max response (screenshots)
             return error.ResponseTooLarge;
@@ -479,7 +580,7 @@ pub const Client = struct {
         const resp_buf = try self.alloc.alloc(u8, resp_len);
         defer self.alloc.free(resp_buf);
 
-        try readExact(self.socket, resp_buf);
+        try self.read(resp_buf);
 
         return try parseResponse(self.alloc, resp_buf);
     }
@@ -586,6 +687,16 @@ test "socket path generation" {
     const custom_path = try getSocketPath(alloc, "my-instance");
     defer alloc.free(custom_path);
     try std.testing.expect(std.mem.endsWith(u8, custom_path, "my-instance.sock"));
+}
+
+test "socket class suffix preserves instance isolation" {
+    const alloc = std.testing.allocator;
+    const stem = try getSocketPath(alloc, "com.example.agent");
+    defer alloc.free(stem);
+    const suffixed = try getSocketPath(alloc, "com.example.agent.sock");
+    defer alloc.free(suffixed);
+    try std.testing.expect(!std.mem.eql(u8, stem, suffixed));
+    try std.testing.expect(std.mem.endsWith(u8, suffixed, "com.example.agent.sock.sock"));
 }
 
 test "request serialization new_window" {

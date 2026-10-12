@@ -18,15 +18,22 @@ const log = std.log.scoped(.gtk_ipc_server);
 /// Maximum message size (16 MB for screenshots).
 const max_message_size: usize = 16 * 1024 * 1024;
 
-/// Maximum number of concurrent client threads.
-const max_concurrent_clients: u32 = 8;
+/// Track connection ownership so shutdown can cancel unfinished reads and
+/// callbacks before waiting for workers after the GTK main loop has stopped.
+const Client = struct {
+    fd: posix.socket_t,
+    next: ?*Client = null,
+    dispatch: ?*ClientDispatch = null,
+    phase: enum { reading, dispatching, writing } = .reading,
+};
 
 /// Context passed from client thread to main thread via glib.idleAdd.
 const ClientDispatch = struct {
     server: *Server,
-    client_fd: posix.socket_t,
+    client: *Client,
     request: socket_client.Request,
     arena: std.heap.ArenaAllocator,
+    source_id: c_uint = 0,
 
     // Synchronization: thread waits for main thread to produce response.
     mutex: std.Thread.Mutex = .{},
@@ -40,11 +47,15 @@ pub const Server = struct {
     alloc: Allocator,
     socket_fd: posix.socket_t,
     socket_path: []u8,
+    socket_inode: u64,
+    socket_device: u64,
+    owner_lock: std.fs.File,
     app: *Application,
     accept_thread: ?std.Thread = null,
     client_mutex: std.Thread.Mutex = .{},
     client_cond: std.Thread.Condition = .{},
-    active_clients: u32 = 0,
+    active_clients: usize = 0,
+    clients: ?*Client = null,
     shutting_down: bool = false,
 
     /// Initialize and start the server.
@@ -54,21 +65,42 @@ pub const Server = struct {
 
         // Create socket directory
         const dir_path = std.fs.path.dirname(socket_path) orelse return error.InvalidPath;
-        std.fs.makeDirAbsolute(dir_path) catch |e| switch (e) {
+        posix.mkdir(dir_path, 0o700) catch |e| switch (e) {
             error.PathAlreadyExists => {},
             else => return e,
         };
 
-        // Set directory permissions to 700 (iterate=true to get a real fd, not O_PATH)
-        var dir = try std.fs.openDirAbsolute(dir_path, .{ .iterate = true });
-        defer dir.close();
-        dir.chmod(0o700) catch {};
-
-        // Remove existing socket file
-        try socket_client.removeSocketFile(socket_path);
+        try socket_client.validateSocketDirectory(socket_path);
+        // Only one application may own a pathname. Keep ownership separate
+        // from bootstrap coordination so starting the server cannot deadlock.
+        const lock_path = try std.fmt.allocPrintSentinel(alloc, "{s}.owner.lock", .{socket_path}, 0);
+        defer alloc.free(lock_path);
+        const owner_lock: std.fs.File = .{ .handle = try posix.openZ(lock_path, .{
+            .ACCMODE = .RDWR,
+            .CREAT = true,
+            .CLOEXEC = true,
+            .NOFOLLOW = true,
+        }, 0o600) };
+        errdefer owner_lock.close();
+        if (!try owner_lock.tryLock(.exclusive)) return error.SocketAlreadyInUse;
+        errdefer owner_lock.unlock();
+        // Older builds have no ownership lock. Never steal their live socket.
+        const target: @import("../ipc.zig").Target = if (instance) |name|
+            .{ .class = try alloc.dupeZ(u8, name) }
+        else
+            .detect;
+        defer if (target == .class) alloc.free(target.class);
+        if (socket_client.Client.initWithOptions(alloc, target, .{ .quiet = true, .timeout_ms = 100 })) |existing| {
+            var live = existing;
+            live.deinit();
+            return error.SocketAlreadyInUse;
+        } else |err| switch (err) {
+            error.FileNotFound, error.ConnectionRefused => try socket_client.removeSocketFile(socket_path),
+            else => return err,
+        }
 
         // Create socket
-        const socket_fd = try posix.socket(posix.AF.UNIX, posix.SOCK.STREAM, 0);
+        const socket_fd = try posix.socket(posix.AF.UNIX, posix.SOCK.STREAM | posix.SOCK.CLOEXEC, 0);
         errdefer posix.close(socket_fd);
 
         // Bind to path
@@ -85,12 +117,16 @@ pub const Server = struct {
         @memcpy(addr.path[0..socket_path.len], socket_path);
 
         try posix.bind(socket_fd, @ptrCast(&addr), @sizeOf(posix.sockaddr.un));
+        const identity = try posix.fstatat(std.fs.cwd().fd, socket_path, posix.AT.SYMLINK_NOFOLLOW);
+        errdefer socket_client.removeSocketFile(socket_path) catch {};
 
         // Set socket file permissions to 600
-        posix.fchmod(socket_fd, 0o600) catch {};
+        const path_z = try alloc.dupeZ(u8, socket_path);
+        defer alloc.free(path_z);
+        if (std.c.chmod(path_z, 0o600) != 0) return error.SocketPermissionsFailed;
 
         // Listen for connections
-        try posix.listen(socket_fd, 5);
+        try posix.listen(socket_fd, std.c.SOMAXCONN);
 
         // Create the server struct
         const self = try alloc.create(Server);
@@ -100,6 +136,9 @@ pub const Server = struct {
             .alloc = alloc,
             .socket_fd = socket_fd,
             .socket_path = socket_path,
+            .socket_inode = @intCast(identity.ino),
+            .socket_device = @intCast(identity.dev),
+            .owner_lock = owner_lock,
             .app = app,
         };
 
@@ -113,23 +152,55 @@ pub const Server = struct {
     pub fn deinit(self: *Server) void {
         self.client_mutex.lock();
         self.shutting_down = true;
+        var next = self.clients;
+        while (next) |client| {
+            next = client.next;
+            switch (client.phase) {
+                .reading => posix.shutdown(client.fd, .both) catch {},
+                .dispatching => {
+                    // GTK callbacks cannot run after its main loop stops.
+                    // Remove each queued source before its worker stack dies.
+                    const dispatch = client.dispatch.?;
+                    _ = glib.Source.remove(dispatch.source_id);
+                    client.dispatch = null;
+                    dispatch.mutex.lock();
+                    dispatch.done = true;
+                    dispatch.cond.signal();
+                    dispatch.mutex.unlock();
+                    posix.shutdown(client.fd, .both) catch {};
+                },
+                // Let completed requests (including the final close) send
+                // their acknowledgement. Response I/O has its own deadline.
+                .writing => {},
+            }
+        }
         self.client_mutex.unlock();
 
-        // Close socket
-        posix.close(self.socket_fd);
+        // Remove our name while the listener is still live. A later owner or
+        // replacement file must survive this application's shutdown.
+        const identity = posix.fstatat(std.fs.cwd().fd, self.socket_path, posix.AT.SYMLINK_NOFOLLOW) catch null;
+        if (identity) |stat| {
+            if (stat.ino == self.socket_inode and stat.dev == self.socket_device and
+                std.fs.File.Stat.fromPosix(stat).kind == .unix_domain_socket)
+                socket_client.removeSocketFile(self.socket_path) catch {};
+        }
+
+        // Closing a descriptor from another thread does not wake accept on
+        // Linux. Shutdown first releases the accept thread's blocked syscall.
+        posix.shutdown(self.socket_fd, .both) catch {};
 
         if (self.accept_thread) |thread| {
             thread.join();
         }
+        posix.close(self.socket_fd);
+        self.owner_lock.unlock();
+        self.owner_lock.close();
 
         self.client_mutex.lock();
         while (self.active_clients > 0) {
             self.client_cond.wait(&self.client_mutex);
         }
         self.client_mutex.unlock();
-
-        // Remove socket file
-        socket_client.removeSocketFile(self.socket_path) catch {};
 
         // Free memory
         self.alloc.free(self.socket_path);
@@ -147,7 +218,7 @@ pub const Server = struct {
                 self.socket_fd,
                 @ptrCast(&client_addr),
                 &addr_len,
-                0,
+                posix.SOCK.NONBLOCK | posix.SOCK.CLOEXEC,
             ) catch |e| {
                 self.client_mutex.lock();
                 const shutting_down = self.shutting_down;
@@ -158,25 +229,26 @@ pub const Server = struct {
                 return;
             };
 
+            const client = self.alloc.create(Client) catch |e| {
+                log.err("failed to allocate client: {}", .{e});
+                posix.close(client_fd);
+                continue;
+            };
             self.client_mutex.lock();
             if (self.shutting_down) {
                 self.client_mutex.unlock();
+                self.alloc.destroy(client);
                 posix.close(client_fd);
                 return;
             }
-            if (self.active_clients >= max_concurrent_clients) {
-                self.client_mutex.unlock();
-                self.sendBusy(client_fd);
-                posix.close(client_fd);
-                continue;
-            }
+            client.* = .{ .fd = client_fd, .next = self.clients };
+            self.clients = client;
             self.active_clients += 1;
             self.client_mutex.unlock();
 
-            const thread = std.Thread.spawn(.{}, clientThread, .{ self, client_fd }) catch |e| {
+            const thread = std.Thread.spawn(.{}, clientThread, .{ self, client }) catch |e| {
                 log.err("failed to spawn client thread: {}", .{e});
-                self.clientDone();
-                posix.close(client_fd);
+                self.clientDone(client);
                 continue;
             };
             thread.detach();
@@ -185,9 +257,9 @@ pub const Server = struct {
 
     /// Client thread: validates peer, reads request, dispatches to main thread,
     /// sends response. All blocking I/O happens here, not on the GTK main loop.
-    fn clientThread(self: *Server, client_fd: posix.socket_t) void {
-        defer self.clientDone();
-        defer posix.close(client_fd);
+    fn clientThread(self: *Server, client: *Client) void {
+        defer self.clientDone(client);
+        const client_fd = client.fd;
 
         // Validate peer is same user
         if (!self.validatePeer(client_fd)) {
@@ -195,29 +267,16 @@ pub const Server = struct {
             return;
         }
 
-        // Set socket timeouts (1s read, 5s write for large responses)
-        const read_timeout = posix.timeval{ .sec = 1, .usec = 0 };
-        posix.setsockopt(
-            client_fd,
-            posix.SOL.SOCKET,
-            posix.SO.RCVTIMEO,
-            std.mem.asBytes(&read_timeout),
-        ) catch {};
-
-        const write_timeout = posix.timeval{ .sec = 5, .usec = 0 };
-        posix.setsockopt(
-            client_fd,
-            posix.SOL.SOCKET,
-            posix.SO.SNDTIMEO,
-            std.mem.asBytes(&write_timeout),
-        ) catch {};
-
         // Read and parse request (blocking, but on this thread)
         var arena = std.heap.ArenaAllocator.init(self.alloc);
         defer arena.deinit();
         const alloc = arena.allocator();
 
         const request = self.readRequest(client_fd, alloc) catch |e| {
+            self.client_mutex.lock();
+            const shutting_down = self.shutting_down;
+            self.client_mutex.unlock();
+            if (shutting_down) return;
             log.err("failed to read request: {}", .{e});
             self.sendReadError(client_fd, e);
             return;
@@ -227,12 +286,21 @@ pub const Server = struct {
         // IPC handlers access GTK widgets and must run on the main thread.
         var dispatch = ClientDispatch{
             .server = self,
-            .client_fd = client_fd,
+            .client = client,
             .request = request,
             .arena = std.heap.ArenaAllocator.init(self.alloc),
         };
+        defer dispatch.arena.deinit();
 
-        _ = glib.idleAdd(mainThreadDispatch, &dispatch);
+        self.client_mutex.lock();
+        if (self.shutting_down) {
+            self.client_mutex.unlock();
+            return;
+        }
+        client.phase = .dispatching;
+        client.dispatch = &dispatch;
+        dispatch.source_id = glib.idleAdd(mainThreadDispatch, &dispatch);
+        self.client_mutex.unlock();
 
         // Wait for main thread to produce the response
         dispatch.mutex.lock();
@@ -240,8 +308,6 @@ pub const Server = struct {
         while (!dispatch.done) {
             dispatch.cond.wait(&dispatch.mutex);
         }
-
-        defer dispatch.arena.deinit();
 
         // Send response (blocking write, on this thread)
         if (dispatch.response) |response| {
@@ -255,6 +321,11 @@ pub const Server = struct {
     /// Handles the request and signals the waiting client thread.
     fn mainThreadDispatch(user_data: ?*anyopaque) callconv(.c) c_int {
         const dispatch: *ClientDispatch = @ptrCast(@alignCast(user_data));
+        const server = dispatch.server;
+        server.client_mutex.lock();
+        dispatch.client.dispatch = null;
+        dispatch.client.phase = .writing;
+        server.client_mutex.unlock();
         const alloc = dispatch.arena.allocator();
 
         const response = dispatch.server.handleRequest(alloc, dispatch.request);
@@ -322,8 +393,9 @@ pub const Server = struct {
         _ = self;
 
         // Read length prefix
+        var deadline = try FrameIo.init(client_fd, std.time.ns_per_s);
         var len_bytes: [4]u8 = undefined;
-        try readExact(client_fd, &len_bytes);
+        try deadline.readExact(&len_bytes);
 
         const msg_len = std.mem.readInt(u32, &len_bytes, .little);
         if (msg_len > max_message_size) {
@@ -332,7 +404,7 @@ pub const Server = struct {
 
         // Read message
         const buf = try alloc.alloc(u8, msg_len);
-        try readExact(client_fd, buf);
+        try deadline.readExact(buf);
 
         // Parse JSON
         const request = try std.json.parseFromSliceLeaky(
@@ -349,13 +421,14 @@ pub const Server = struct {
         _ = self;
 
         const json = try std.json.Stringify.valueAlloc(alloc, response, .{});
+        var deadline = try FrameIo.init(client_fd, 5 * std.time.ns_per_s);
 
         // Send length prefix
         var len_bytes: [4]u8 = undefined;
         std.mem.writeInt(u32, &len_bytes, @intCast(json.len), .little);
 
-        try writeAll(client_fd, &len_bytes);
-        try writeAll(client_fd, json);
+        try deadline.writeAll(&len_bytes);
+        try deadline.writeAll(json);
     }
 
     fn sendError(self: *Server, client_fd: posix.socket_t, message: []const u8) void {
@@ -368,10 +441,6 @@ pub const Server = struct {
         }) catch {};
     }
 
-    fn sendBusy(self: *Server, client_fd: posix.socket_t) void {
-        self.sendError(client_fd, "Too many concurrent IPC requests");
-    }
-
     fn sendReadError(self: *Server, client_fd: posix.socket_t, err: anyerror) void {
         switch (err) {
             error.UnsupportedProtocolVersion => self.sendError(client_fd, "Unsupported protocol version"),
@@ -379,36 +448,94 @@ pub const Server = struct {
         }
     }
 
-    fn clientDone(self: *Server) void {
+    fn clientDone(self: *Server, client: *Client) void {
         self.client_mutex.lock();
-        defer self.client_mutex.unlock();
+        var link = &self.clients;
+        while (link.*) |entry| {
+            if (entry == client) break;
+            link = &entry.next;
+        }
+        std.debug.assert(link.* == client);
+        link.* = client.next;
+        // Closing while ownership is locked prevents shutdown from observing
+        // a descriptor number that another thread has already reused.
+        posix.close(client.fd);
+        self.alloc.destroy(client);
         self.active_clients -= 1;
         if (self.shutting_down and self.active_clients == 0) {
             self.client_cond.signal();
         }
+        self.client_mutex.unlock();
     }
 };
 
-fn readExact(fd: posix.socket_t, buf: []u8) !void {
-    var off: usize = 0;
-    while (off < buf.len) {
-        const n = posix.recv(fd, buf[off..], 0) catch |e| switch (e) {
-            error.WouldBlock => continue,
-            else => return e,
-        };
-        if (n == 0) return error.ConnectionClosed;
-        off += n;
-    }
-}
+/// A deadline covers the full frame, including a slow peer's partial I/O.
+/// Socket timeouts alone restart with each recv and do not bound a frame.
+const FrameIo = struct {
+    fd: posix.socket_t,
+    timer: std.time.Timer,
+    timeout_ns: u64,
 
-fn writeAll(fd: posix.socket_t, buf: []const u8) !void {
-    var off: usize = 0;
-    while (off < buf.len) {
-        const n = posix.send(fd, buf[off..], 0) catch |e| switch (e) {
-            error.WouldBlock => continue,
-            else => return e,
-        };
-        if (n == 0) return error.ConnectionClosed;
-        off += n;
+    fn init(fd: posix.socket_t, timeout_ns: u64) !FrameIo {
+        return .{ .fd = fd, .timer = try std.time.Timer.start(), .timeout_ns = timeout_ns };
     }
+
+    fn wait(self: *FrameIo, events: i16) !void {
+        const elapsed = self.timer.read();
+        if (elapsed >= self.timeout_ns) return error.FrameTimedOut;
+        const remaining_ms = std.math.divCeil(u64, self.timeout_ns - elapsed, std.time.ns_per_ms) catch unreachable;
+        var fds = [_]posix.pollfd{.{ .fd = self.fd, .events = events, .revents = 0 }};
+        if (try posix.poll(&fds, @intCast(@min(remaining_ms, std.math.maxInt(i32)))) == 0)
+            return error.FrameTimedOut;
+    }
+
+    fn readExact(self: *FrameIo, buf: []u8) !void {
+        var off: usize = 0;
+        while (off < buf.len) {
+            try self.wait(posix.POLL.IN);
+            const n = posix.recv(self.fd, buf[off..], 0) catch |e| switch (e) {
+                error.WouldBlock => continue,
+                else => return e,
+            };
+            if (n == 0) return error.ConnectionClosed;
+            off += n;
+        }
+    }
+
+    fn writeAll(self: *FrameIo, buf: []const u8) !void {
+        var off: usize = 0;
+        while (off < buf.len) {
+            try self.wait(posix.POLL.OUT);
+            const n = posix.send(self.fd, buf[off..], posix.MSG.NOSIGNAL) catch |e| switch (e) {
+                error.WouldBlock => continue,
+                else => return e,
+            };
+            if (n == 0) return error.ConnectionClosed;
+            off += n;
+        }
+    }
+};
+
+test "GTK IPC partial frames expire while healthy frames still complete" {
+    if (builtin.os.tag != .linux) return error.SkipZigTest;
+    var fds: [2]posix.fd_t = undefined;
+    if (std.c.socketpair(posix.AF.UNIX, posix.SOCK.STREAM | posix.SOCK.NONBLOCK | posix.SOCK.CLOEXEC, 0, &fds) != 0)
+        return error.SocketPairCreationFailed;
+    defer posix.close(fds[0]);
+    defer posix.close(fds[1]);
+
+    _ = try posix.send(fds[1], "\x01\x00", posix.MSG.NOSIGNAL);
+    var stalled = try FrameIo.init(fds[0], 20 * std.time.ns_per_ms);
+    var prefix: [4]u8 = undefined;
+    try std.testing.expectError(error.FrameTimedOut, stalled.readExact(&prefix));
+
+    _ = try posix.send(fds[1], "ok", posix.MSG.NOSIGNAL);
+    var healthy = try FrameIo.init(fds[0], 100 * std.time.ns_per_ms);
+    var message: [2]u8 = undefined;
+    try healthy.readExact(&message);
+    try std.testing.expectEqualStrings("ok", &message);
+
+    try posix.shutdown(fds[1], .both);
+    var closed = try FrameIo.init(fds[0], 100 * std.time.ns_per_ms);
+    try std.testing.expectError(error.ConnectionClosed, closed.readExact(&prefix));
 }

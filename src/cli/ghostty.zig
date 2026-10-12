@@ -30,6 +30,8 @@ const screenshot_surface = @import("screenshot_surface.zig");
 const send_key = @import("send_key.zig");
 const send_mouse = @import("send_mouse.zig");
 const send_scroll = @import("send_scroll.zig");
+const doctor = @import("doctor.zig");
+const bootstrap = @import("bootstrap.zig");
 
 /// Special commands that can be invoked via CLI flags. These are all
 /// invoked by using `+<action>` as a CLI flag. The only exception is
@@ -112,6 +114,12 @@ pub const Action = enum {
 
     // Use IPC to send a scroll event to a surface.
     @"send-scroll",
+
+    /// Check Automator readiness and platform capabilities as JSON.
+    doctor,
+
+    /// Find or start a usable Automator terminal and return its surface as JSON.
+    bootstrap,
 
     pub fn detectSpecialCase(arg: []const u8) ?SpecialCase(Action) {
         // If we see a "-e" and we haven't seen a command yet, then
@@ -202,6 +210,8 @@ pub const Action = enum {
             .@"send-key" => try send_key.run(alloc),
             .@"send-mouse" => try send_mouse.run(alloc),
             .@"send-scroll" => try send_scroll.run(alloc),
+            .doctor => try doctor.run(alloc),
+            .bootstrap => try bootstrap.run(alloc),
         };
     }
 
@@ -212,7 +222,7 @@ pub const Action = enum {
             const filename = filename: {
                 const tag = @tagName(self);
                 var filename: [tag.len]u8 = undefined;
-                _ = std.mem.replace(u8, tag, "-", "_", &filename);
+                for (tag, 0..) |c, i| filename[i] = if (c == '-') '_' else c;
                 break :filename &filename;
             };
 
@@ -252,10 +262,18 @@ pub const Action = enum {
                 .@"send-key" => send_key.Options,
                 .@"send-mouse" => send_mouse.Options,
                 .@"send-scroll" => send_scroll.Options,
+                .doctor => doctor.Options,
+                .bootstrap => bootstrap.Options,
             };
         }
     }
 };
+
+test {
+    std.testing.refAllDecls(doctor);
+    std.testing.refAllDecls(bootstrap);
+    std.testing.refAllDecls(@import("agent_ipc.zig"));
+}
 
 test "parse action none" {
     const testing = std.testing;

@@ -128,14 +128,17 @@ class IPCSocketServer {
     private func getSocketPath() throws -> String {
         let uid = getuid()
 
-        // Try TMPDIR first (macOS sets this per-user)
-        if let tmpdir = ProcessInfo.processInfo.environment["TMPDIR"] {
-            let dir = (tmpdir as NSString).appendingPathComponent("ghostty-automator-\(uid)")
-            return (dir as NSString).appendingPathComponent("ghostty-automator.sock")
+        // Use the OS user directory so agents with a different TMPDIR can
+        // discover an already-running app launched by LaunchServices.
+        let length = confstr(_CS_DARWIN_USER_TEMP_DIR, nil, 0)
+        guard length > 0 else { throw IPCError.fileSystem("User temporary directory unavailable") }
+        var buffer = [CChar](repeating: 0, count: length)
+        let result = confstr(_CS_DARWIN_USER_TEMP_DIR, &buffer, buffer.count)
+        guard result > 0, result <= buffer.count else {
+            throw IPCError.fileSystem("User temporary directory unavailable")
         }
-
-        // Fallback to /tmp/ghostty-automator-$UID
-        let dir = "/tmp/ghostty-automator-\(uid)"
+        let tmpdir = String(cString: buffer)
+        let dir = (tmpdir as NSString).appendingPathComponent("ghostty-automator-\(uid)")
         return (dir as NSString).appendingPathComponent("ghostty-automator.sock")
     }
 
@@ -147,6 +150,12 @@ class IPCSocketServer {
             withIntermediateDirectories: true,
             attributes: [.posixPermissions: 0o700]
         )
+        var info = stat()
+        guard dir.withCString({ lstat($0, &info) }) == 0,
+              (info.st_mode & S_IFMT) == S_IFDIR,
+              info.st_uid == getuid(), info.st_mode & 0o077 == 0 else {
+            throw IPCError.fileSystem("Unsafe socket directory")
+        }
     }
 
     // MARK: - Socket Creation
