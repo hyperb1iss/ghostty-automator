@@ -31,7 +31,8 @@ sessions.
 
 ## Install
 
-The doctor and bootstrap commands are available in `v1.3.1-auto.2` and later.
+Install `v1.3.1-auto.3` or later for the doctor and bootstrap commands with
+portable Linux CPU targets.
 
 Install the latest release and the agent skill with one command:
 

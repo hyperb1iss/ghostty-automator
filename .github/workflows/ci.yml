@@ -71,10 +71,10 @@ jobs:
       - uses: astral-sh/setup-uv@1c37ad07a6a961277cf70c0d37d6f313000f5884 # v10.3.0
 
       - name: Build
-        run: zig build -Doptimize=ReleaseSafe -Dsentry=false -fno-sys=gtk4-layer-shell
+        run: zig build -Doptimize=ReleaseSafe -Dcpu=baseline -Dsentry=false -fno-sys=gtk4-layer-shell
 
       - name: Test
-        run: zig build test -Dsentry=false -fno-sys=gtk4-layer-shell
+        run: zig build test -Dcpu=baseline -Dsentry=false -fno-sys=gtk4-layer-shell
 
       - name: Exercise live automation in an isolated display
         run: xvfb-run -a -s '-screen 0 1920x1080x24' dbus-run-session -- uv run test/automation/live.py --binary zig-out/bin/ghostty-automator

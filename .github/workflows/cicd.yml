@@ -50,7 +50,7 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y libgtk-4-dev libadwaita-1-dev \
-            gettext libonig-dev pkg-config meson ninja-build python3-gi
+            gettext libonig-dev pkg-config meson ninja-build python3-gi qemu-user
 
       # Ubuntu 24.04 ships Blueprint 0.12; source builds require at least 0.16.
       - name: Install Blueprint compiler
@@ -73,7 +73,7 @@ jobs:
       - name: Build
         shell: bash
         run: |
-          build_args=(-Doptimize=ReleaseFast -Dsentry=false -Dxcframework-target=native)
+          build_args=(-Doptimize=ReleaseFast -Dcpu=baseline -Dsentry=false -Dxcframework-target=native)
           if [[ "$RUNNER_OS" = Linux ]]; then build_args+=(-fno-sys=gtk4-layer-shell); fi
           zig build "${build_args[@]}"
 
@@ -94,6 +94,19 @@ jobs:
               bash install.sh --archive "$archive"
           done
           "$install_sandbox/prefix/bin/ghostty-automator" +version
+          # Exercise the packaged ELF on a CPU without runner-specific features.
+          if [[ "$RUNNER_OS" == Linux ]]; then
+            case "$(uname -m)" in
+              x86_64) emulator=qemu-x86_64; cpu=qemu64 ;;
+              aarch64) emulator=qemu-aarch64; cpu=cortex-a53 ;;
+              *) exit 1 ;;
+            esac
+            runtime="$install_sandbox/prefix/lib/ghostty-automator"
+            for action in +version +help; do
+              LD_LIBRARY_PATH="$runtime/lib" "$emulator" -cpu "$cpu" \
+                "$runtime/bin/ghostty-automator" "$action"
+            done
+          fi
 
       - name: Upload release archive and checksum
         uses: actions/upload-artifact@v7
