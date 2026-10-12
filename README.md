@@ -31,10 +31,7 @@ sessions.
 
 ## Install
 
-The doctor and bootstrap commands described below are new in this source
-refresh. Use the [source install](#pinned-offline-and-source-installs) until a
-release containing those commands is available; older release archives lack
-them.
+The doctor and bootstrap commands are available in `v1.3.1-auto.2` and later.
 
 Install the latest release and the agent skill with one command:
 

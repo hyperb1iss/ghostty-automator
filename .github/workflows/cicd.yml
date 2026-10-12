@@ -103,13 +103,57 @@ jobs:
           if-no-files-found: error
 
   github-release:
-    if: startsWith(github.ref, 'refs/tags/v')
+    if: github.repository == 'hyperb1iss/ghostty-automator'
     needs: build
-    uses: hyperb1iss/shared-workflows/.github/workflows/github-release.yml@main
-    with:
-      attach-artifacts: true
-      artifact-pattern: 'release-*'
-    secrets: inherit
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: actions/download-artifact@v8
+        with:
+          pattern: release-*
+          merge-multiple: true
+          path: release-artifacts
+
+      # Keep installer asset names intact; verify these during dry runs too.
+      - name: Verify release assets
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd release-artifacts
+          archives=(ghostty-automator-linux-amd64.tar.gz
+                    ghostty-automator-linux-arm64.tar.gz
+                    ghostty-automator-macos-arm64.zip)
+          for archive in "${archives[@]}"; do
+            test -s "$archive"
+            test -s "$archive.sha256"
+            sha256sum "$archive" | diff -u "$archive.sha256" -
+          done
+
+      - name: Publish complete stable release
+        if: startsWith(github.ref, 'refs/tags/v')
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ github.ref_name }}
+          RELEASE_REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          [[ "$RELEASE_TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-auto\.[0-9]+)?$ ]]
+          notes="docs/releases/$RELEASE_TAG.md"
+          test -s "$notes"
+          assets=()
+          for archive in ghostty-automator-linux-amd64.tar.gz \
+                         ghostty-automator-linux-arm64.tar.gz \
+                         ghostty-automator-macos-arm64.zip; do
+            assets+=("release-artifacts/$archive" "release-artifacts/$archive.sha256")
+          done
+          gh release create "$RELEASE_TAG" "${assets[@]}" \
+            --repo "$RELEASE_REPO" --verify-tag --draft \
+            --title "Ghostty Automator $RELEASE_TAG" --notes-file "$notes"
+          # The auto suffix identifies the stable fork's release sequence.
+          gh release edit "$RELEASE_TAG" --repo "$RELEASE_REPO" \
+            --draft=false --prerelease=false --latest
 
   # The generic binary formula generator drops macOS app frameworks and skills.
   # Preserve the complete release in libexec and create an app-backed CLI instead.
