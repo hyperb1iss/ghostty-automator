@@ -91,15 +91,22 @@ test-nix:
 
 # ── Install ─────────────────────────────────────────────────────
 
-# Install to /usr/local/bin
-install: build-release
-    cp -R zig-out/Ghostty.app "/Applications/Ghostty Automator.app"
-    sudo ln -sf "/Applications/Ghostty Automator.app/Contents/MacOS/ghostty" /usr/local/bin/ghostty-automator
+# Install a release build and agent skills into user-writable directories
+install *args: build-release
+    bash install.sh --build-dir zig-out {{args}}
 
-# Install skills to Claude Code plugin directory
-install-skills dest="~/.claude/skills":
-    mkdir -p {{dest}}/ghostty-terminal-automation
-    cp skills/ghostty-terminal-automation/SKILL.md {{dest}}/ghostty-terminal-automation/
+# Package a release build with its runtime data, skills, and checksum
+package *args: build-release
+    scripts/package.sh {{args}}
+
+# Install the skill for agents without building Ghostty
+install-skills dest="${HOME}/.agents/skills":
+    bash install.sh --skills-only --skill-dir "{{dest}}"
+
+# Test offline Linux and macOS package installation
+test-packaging:
+    shellcheck install.sh scripts/package.sh test/automation/package-install.sh
+    bash test/automation/package-install.sh
 
 # ── Clean ───────────────────────────────────────────────────────
 

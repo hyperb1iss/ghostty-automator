@@ -1,6 +1,4 @@
-# Ghostty Automator — CI
-# Build and test on push to automator branch and PRs.
-
+# Build and exercise the agent CLI and installation paths on every change.
 name: CI
 
 on:
@@ -17,21 +15,50 @@ env:
   ZIG_VERSION: "0.15.2"
 
 jobs:
+  packaging:
+    strategy:
+      matrix:
+        runner: [ubuntu-24.04, macos-26]
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install shellcheck
+        if: runner.os == 'macOS'
+        run: brew install shellcheck
+
+      - name: Check installer and packager
+        run: |
+          shellcheck install.sh scripts/package.sh test/automation/package-install.sh
+          bash test/automation/package-install.sh
+
   build-linux:
     runs-on: ubuntu-24.04
     timeout-minutes: 60
     steps:
       - uses: actions/checkout@v6
 
-      - uses: cachix/install-nix-action@v31
+      - name: Install Zig
+        uses: mlugg/setup-zig@v2.2.1
         with:
-          nix_path: nixpkgs=channel:nixos-unstable
+          version: ${{ env.ZIG_VERSION }}
+
+      - name: Install build and automation dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libgtk-4-dev libadwaita-1-dev \
+            blueprint-compiler gettext libonig-dev pkg-config xvfb dbus-x11
+
+      - uses: astral-sh/setup-uv@1c37ad07a6a961277cf70c0d37d6f313000f5884 # v10.3.0
 
       - name: Build
-        run: nix develop -c zig build -Doptimize=ReleaseSafe
+        run: zig build -Doptimize=ReleaseSafe -Dsentry=false -fno-sys=gtk4-layer-shell
 
       - name: Test
-        run: nix develop -c zig build test
+        run: zig build test -Dsentry=false -fno-sys=gtk4-layer-shell
+
+      - name: Exercise live automation in an isolated display
+        run: xvfb-run -a dbus-run-session -- uv run test/automation/live.py --binary zig-out/bin/ghostty-automator
 
   build-macos:
     runs-on: macos-26
@@ -45,4 +72,4 @@ jobs:
           version: ${{ env.ZIG_VERSION }}
 
       - name: Build
-        run: zig build -Doptimize=ReleaseSafe
+        run: zig build -Doptimize=ReleaseSafe -Dsentry=false -Dxcframework-target=native

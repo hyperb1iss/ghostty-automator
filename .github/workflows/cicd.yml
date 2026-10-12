@@ -1,15 +1,4 @@
-# Ghostty Automator — CI/CD Pipeline
-# Triggered by version tags. Builds all platforms, creates GitHub release,
-# updates Homebrew tap.
-#
-# Each build job produces two artifacts:
-#   - binaries-${target}  → raw ghostty-automator binary, consumed by the
-#                           shared homebrew-update workflow (which tars it
-#                           and generates a `bin.install` formula).
-#   - release-${target}   → per-platform tarball/zip with unique filename,
-#                           consumed by the shared github-release workflow
-#                           (which flattens all artifacts onto the release).
-
+# Build self-contained releases with the same packager used by local agents.
 name: CI/CD
 
 on:
@@ -25,11 +14,18 @@ env:
   ZIG_VERSION: "0.15.2"
 
 jobs:
-  # ==========================================================================
-  # Build — macOS (Apple Silicon)
-  # ==========================================================================
-  build-macos-arm64:
-    runs-on: macos-26
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: macos-arm64
+            runner: macos-26
+          - platform: linux-amd64
+            runner: ubuntu-24.04
+          - platform: linux-arm64
+            runner: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runner }}
     timeout-minutes: 120
     steps:
       - uses: actions/checkout@v6
@@ -39,168 +35,174 @@ jobs:
         with:
           version: ${{ env.ZIG_VERSION }}
 
-      - name: Build
-        run: zig build -Doptimize=ReleaseFast
-
-      - name: Package — homebrew (CLI + share/ support payload)
+      - name: Install Linux build dependencies
+        if: runner.os == 'Linux'
         run: |
-          mkdir -p brew-staging
-          # On macOS the CLI binary lives inside the app bundle
-          cp zig-out/Ghostty.app/Contents/MacOS/Ghostty brew-staging/ghostty-automator
-          if [ -d zig-out/share ]; then
-            cp -R zig-out/share brew-staging/share
-          fi
-
-      - name: Package — release (app + CLI + skills)
-        run: |
-          mkdir -p rel-staging
-          cp -R zig-out/Ghostty.app rel-staging/
-          # Also ship the CLI binary at the top level for direct use
-          cp zig-out/Ghostty.app/Contents/MacOS/Ghostty rel-staging/ghostty-automator
-          cp -R skills rel-staging/
-          cd rel-staging
-          zip -r ../ghostty-automator-macos-arm64.zip .
-
-      - name: Upload binaries-macos-arm64
-        uses: actions/upload-artifact@v7
-        with:
-          name: binaries-macos-arm64
-          path: brew-staging/
-          if-no-files-found: error
-
-      - name: Upload release-macos-arm64
-        uses: actions/upload-artifact@v7
-        with:
-          name: release-macos-arm64
-          path: ghostty-automator-macos-arm64.zip
-          if-no-files-found: error
-
-  # ==========================================================================
-  # Build — Linux x86_64
-  # ==========================================================================
-  build-linux-x86_64:
-    runs-on: ubuntu-24.04
-    timeout-minutes: 60
-    steps:
-      - uses: actions/checkout@v6
-
-      - uses: cachix/install-nix-action@v31
-        with:
-          nix_path: nixpkgs=channel:nixos-unstable
+          sudo apt-get update
+          sudo apt-get install -y libgtk-4-dev libadwaita-1-dev \
+            blueprint-compiler gettext libonig-dev pkg-config
 
       - name: Build
+        shell: bash
         run: |
-          nix develop -c zig build -Doptimize=ReleaseFast
+          build_args=(-Doptimize=ReleaseFast -Dsentry=false -Dxcframework-target=native)
+          if [[ "$RUNNER_OS" = Linux ]]; then build_args+=(-fno-sys=gtk4-layer-shell); fi
+          zig build "${build_args[@]}"
 
-      - name: Package — homebrew (CLI + share/ support payload)
+      - name: Package app, runtime data, skills, and installer
+        run: scripts/package.sh --platform '${{ matrix.platform }}' --output-dir release-artifacts
+
+      - name: Verify installation from release archive
+        shell: bash
         run: |
-          mkdir -p brew-staging
-          cp zig-out/bin/ghostty-automator brew-staging/
-          if [ -d zig-out/share ]; then
-            cp -R zig-out/share brew-staging/share
-          fi
+          install_sandbox="$(mktemp -d)"
+          trap 'rm -rf -- "$install_sandbox"' EXIT
+          for archive in release-artifacts/*.tar.gz release-artifacts/*.zip; do
+            [ -f "$archive" ] || continue
+            INSTALL_DIR="$install_sandbox/prefix" \
+              SKILL_DIR="$install_sandbox/skills" \
+              CLAUDE_SKILL_DIR="$install_sandbox/claude-skills" \
+              APP_DIR="$install_sandbox/Ghostty Automator.app" \
+              bash install.sh --archive "$archive"
+          done
+          "$install_sandbox/prefix/bin/ghostty-automator" +version
 
-      - name: Package — release (full tarball with share/ and skills/)
-        run: |
-          pkg=ghostty-automator-linux-amd64
-          mkdir -p "rel-staging/${pkg}/bin" \
-                   "rel-staging/${pkg}/share" \
-                   "rel-staging/${pkg}/skills"
-          cp zig-out/bin/ghostty-automator "rel-staging/${pkg}/bin/"
-          # Terminfo, shell integration, etc.
-          if [ -d zig-out/share ]; then
-            cp -R zig-out/share/. "rel-staging/${pkg}/share/"
-          fi
-          cp -R skills/. "rel-staging/${pkg}/skills/"
-          (cd rel-staging && tar czf "../${pkg}.tar.gz" "${pkg}")
-
-      - name: Upload binaries-linux-amd64
+      - name: Upload release archive and checksum
         uses: actions/upload-artifact@v7
         with:
-          name: binaries-linux-amd64
-          path: brew-staging/
+          name: release-${{ matrix.platform }}
+          path: release-artifacts/
           if-no-files-found: error
 
-      - name: Upload release-linux-amd64
-        uses: actions/upload-artifact@v7
-        with:
-          name: release-linux-amd64
-          path: ghostty-automator-linux-amd64.tar.gz
-          if-no-files-found: error
-
-  # ==========================================================================
-  # Build — Linux arm64
-  # ==========================================================================
-  build-linux-arm64:
-    runs-on: ubuntu-24.04-arm
-    timeout-minutes: 60
-    steps:
-      - uses: actions/checkout@v6
-
-      - uses: cachix/install-nix-action@v31
-        with:
-          nix_path: nixpkgs=channel:nixos-unstable
-
-      - name: Build
-        run: |
-          nix develop -c zig build -Doptimize=ReleaseFast
-
-      - name: Package — homebrew (CLI + share/ support payload)
-        run: |
-          mkdir -p brew-staging
-          cp zig-out/bin/ghostty-automator brew-staging/
-          if [ -d zig-out/share ]; then
-            cp -R zig-out/share brew-staging/share
-          fi
-
-      - name: Package — release (full tarball with share/ and skills/)
-        run: |
-          pkg=ghostty-automator-linux-arm64
-          mkdir -p "rel-staging/${pkg}/bin" \
-                   "rel-staging/${pkg}/share" \
-                   "rel-staging/${pkg}/skills"
-          cp zig-out/bin/ghostty-automator "rel-staging/${pkg}/bin/"
-          if [ -d zig-out/share ]; then
-            cp -R zig-out/share/. "rel-staging/${pkg}/share/"
-          fi
-          cp -R skills/. "rel-staging/${pkg}/skills/"
-          (cd rel-staging && tar czf "../${pkg}.tar.gz" "${pkg}")
-
-      - name: Upload binaries-linux-arm64
-        uses: actions/upload-artifact@v7
-        with:
-          name: binaries-linux-arm64
-          path: brew-staging/
-          if-no-files-found: error
-
-      - name: Upload release-linux-arm64
-        uses: actions/upload-artifact@v7
-        with:
-          name: release-linux-arm64
-          path: ghostty-automator-linux-arm64.tar.gz
-          if-no-files-found: error
-
-  # ==========================================================================
-  # GitHub Release — uses the unique-named per-platform tarballs/zips
-  # ==========================================================================
   github-release:
-    needs: [build-macos-arm64, build-linux-x86_64, build-linux-arm64]
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: build
     uses: hyperb1iss/shared-workflows/.github/workflows/github-release.yml@main
     with:
       attach-artifacts: true
       artifact-pattern: 'release-*'
     secrets: inherit
 
-  # ==========================================================================
-  # Homebrew Tap Update — uses the raw binary-only artifacts
-  # ==========================================================================
+  # The generic binary formula generator drops macOS app frameworks and skills.
+  # Preserve the complete release in libexec and create an app-backed CLI instead.
   homebrew:
-    needs: [github-release]
-    uses: hyperb1iss/shared-workflows/.github/workflows/homebrew-update.yml@main
-    with:
-      formula-name: ghostty-automator
-      tap-repo: hyperb1iss/homebrew-tap
-      description: "Ghostty with built-in terminal automation for AI agents"
-      homepage: "https://github.com/hyperb1iss/ghostty-automator"
-      binary-names: "ghostty-automator"
-    secrets: inherit
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: github-release
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          pattern: release-*
+          merge-multiple: true
+          path: release-artifacts
+
+      - name: Generate app-aware Homebrew formula
+        env:
+          RELEASE_TAG: ${{ github.ref_name }}
+          RELEASE_REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          ruby <<'RUBY'
+          require 'digest'
+          tag = ENV.fetch('RELEASE_TAG')
+          abort 'Expected vX.Y.Z or vX.Y.Z-auto.N release tag' unless tag.match?(/\Av\d+\.\d+\.\d+(?:-auto\.\d+)?\z/)
+          repository = ENV.fetch('RELEASE_REPO')
+          abort 'Invalid repository' unless repository.match?(/\A[\w.-]+\/[\w.-]+\z/)
+          targets = {
+            'macos-arm64' => ['macos', 'arm', 'zip'],
+            'linux-amd64' => ['linux', 'intel', 'tar.gz'],
+            'linux-arm64' => ['linux', 'arm', 'tar.gz'],
+          }
+          formula = <<~FORMULA
+            class GhosttyAutomator < Formula
+              desc "Ghostty with terminal automation for AI agents"
+              homepage "https://github.com/#{repository}"
+              version "#{tag.delete_prefix('v')}"
+              license "MIT"
+              depends_on "libadwaita" => :linux
+          FORMULA
+          targets.each do |target, (os, cpu, extension)|
+            name = "ghostty-automator-#{target}.#{extension}"
+            path = "release-artifacts/#{name}"
+            checksum = Digest::SHA256.file(path).hexdigest
+            expected = File.read("#{path}.sha256").split.first
+            abort "Checksum mismatch: #{name}" unless checksum == expected
+            formula << <<~FORMULA
+
+              on_#{os} do
+                if Hardware::CPU.#{cpu}?
+                  url "https://github.com/#{repository}/releases/download/#{tag}/#{name}"
+                  sha256 "#{checksum}"
+                end
+              end
+            FORMULA
+          end
+          formula << <<~'FORMULA'
+
+              def install
+                libexec.install buildpath.children
+                executable = OS.mac? ? libexec/"Ghostty.app/Contents/MacOS/Ghostty" : libexec/"bin/ghostty-automator"
+                resources = OS.mac? ? "unset GHOSTTY_RESOURCES_DIR" : "export GHOSTTY_RESOURCES_DIR=\"#{libexec}/share/ghostty\""
+                libraries = OS.mac? ? "" : "export LD_LIBRARY_PATH=\"#{libexec}/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}\""
+                (bin/"ghostty-automator").write <<~EOS
+                  #!/usr/bin/env bash
+                  #{resources}
+                  #{libraries}
+                  export GHOSTTY_AUTOMATOR_SKILLS_DIR="#{libexec}/skills"
+                  exec "#{executable}" "$@"
+                EOS
+                (bin/"ghostty-automator").chmod 0755
+              end
+
+              def caveats
+                <<~EOS
+                  Agent skill: #{libexec}/skills/ghostty-terminal-automation
+                  Run ghostty-automator +doctor, then ghostty-automator +bootstrap.
+                  Linux releases require GTK 4.14+ and libadwaita 1.5+ from the host.
+                EOS
+              end
+
+              test do
+                system bin/"ghostty-automator", "+version"
+              end
+            end
+          FORMULA
+          File.write('ghostty-automator.rb', formula)
+          RUBY
+          ruby -c ghostty-automator.rb
+
+      - name: Update formula in tap
+        env:
+          GH_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: |
+          ruby <<'RUBY'
+          require 'base64'
+          require 'json'
+          require 'open3'
+          require 'rubygems'
+          endpoint = 'repos/hyperb1iss/homebrew-tap/contents/Formula/ghostty-automator.rb'
+          contents = File.read('ghostty-automator.rb')
+          result, errors, status = Open3.capture3('gh', 'api', endpoint)
+          payload = {
+            message: "Update ghostty-automator to #{ENV.fetch('RELEASE_TAG')}",
+            content: Base64.strict_encode64(contents),
+          }
+          if status.success?
+            existing = JSON.parse(result)
+            old = Base64.decode64(existing.fetch('content'))
+            exit 0 if old == contents
+            version = ->(text) {
+              match = text.match(/\bversion\s+["'](\d+\.\d+\.\d+(?:-auto\.\d+)?)["']/)
+              abort 'Cannot compare existing formula version' unless match
+              Gem::Version.new(match[1])
+            }
+            abort 'Refusing to replace a newer formula' if (version.call(old) <=> version.call(contents)) == 1
+            payload[:sha] = existing.fetch('sha')
+          elsif !errors.include?('HTTP 404')
+            abort errors
+          end
+          _, errors, status = Open3.capture3('gh', 'api', '--method', 'PUT', endpoint,
+                                            '--input', '-', stdin_data: JSON.generate(payload))
+          abort errors unless status.success?
+          RUBY
