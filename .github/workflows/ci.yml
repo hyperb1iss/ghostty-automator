@@ -3,7 +3,7 @@ name: CI
 
 on:
   push:
-    branches: [automator]
+    branches: ["**"]
   pull_request:
     branches: [automator]
 
@@ -58,7 +58,9 @@ jobs:
         run: zig build test -Dsentry=false -fno-sys=gtk4-layer-shell
 
       - name: Exercise live automation in an isolated display
-        run: xvfb-run -a dbus-run-session -- uv run test/automation/live.py --binary zig-out/bin/ghostty-automator
+        run: xvfb-run -a -s '-screen 0 1920x1080x24' dbus-run-session -- uv run test/automation/live.py --binary zig-out/bin/ghostty-automator
+        env:
+          LD_LIBRARY_PATH: ${{ github.workspace }}/zig-out/lib
 
   build-macos:
     runs-on: macos-26
