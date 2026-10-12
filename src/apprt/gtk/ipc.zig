@@ -228,17 +228,9 @@ pub fn resizeSurface(app: *Application, surface_id: []const u8, rows: u32, cols:
     const new_rows = if (rows > 0) rows else current_grid.rows;
     const new_cols = if (cols > 0) cols else current_grid.columns;
 
-    // Get cell size for pixel calculation
-    const cell_width: c_int = @intCast(core.size.cell.width);
-    const cell_height: c_int = @intCast(core.size.cell.height);
-
-    if (cell_width == 0 or cell_height == 0) {
+    if (core.size.cell.width == 0 or core.size.cell.height == 0) {
         return ipc.err("Invalid cell size");
     }
-
-    // Calculate new window size in pixels
-    const new_width = @as(c_int, @intCast(new_cols)) * cell_width;
-    const new_height = @as(c_int, @intCast(new_rows)) * cell_height;
 
     // Get the window and resize it
     const root = surface.as(gtk.Widget).getRoot() orelse {
@@ -246,7 +238,25 @@ pub fn resizeSurface(app: *Application, surface_id: []const u8, rows: u32, cols:
     };
 
     if (gobject.ext.cast(gtk.Window, root)) |gtk_window| {
+        const widget = gtk_window.as(gtk.Widget);
+        const scale: u64 = @intCast(@max(1, widget.getScaleFactor()));
+        // GL viewport and cell metrics use physical pixels; GTK window sizes
+        // use logical pixels. Keep the measured chrome outside the viewport.
+        const width_px = @as(u64, new_cols) * core.size.cell.width +
+            core.size.padding.left + core.size.padding.right;
+        const height_px = @as(u64, new_rows) * core.size.cell.height +
+            core.size.padding.top + core.size.padding.bottom;
+        const chrome_width = @as(i64, widget.getAllocatedWidth()) -
+            @as(i64, @intCast(std.math.divCeil(u64, core.size.screen.width, scale) catch unreachable));
+        const chrome_height = @as(i64, widget.getAllocatedHeight()) -
+            @as(i64, @intCast(std.math.divCeil(u64, core.size.screen.height, scale) catch unreachable));
+        const new_width = std.math.cast(c_int, @as(i64, @intCast(std.math.divCeil(u64, width_px, scale) catch unreachable)) + chrome_width) orelse
+            return ipc.err("Requested width is too large");
+        const new_height = std.math.cast(c_int, @as(i64, @intCast(std.math.divCeil(u64, height_px, scale) catch unreachable)) + chrome_height) orelse
+            return ipc.err("Requested height is too large");
         gtk_window.setDefaultSize(new_width, new_height);
+    } else {
+        return ipc.err("Surface has no resizable window");
     }
 
     return ipc.success();
@@ -555,15 +565,26 @@ pub fn sendKey(
     // Parse modifiers
     const mods = parseMods(mods_str);
 
+    // Physical W3C codes need text as well as a key identity for legacy PTYs.
+    // Use the standard US mapping, matching Key.codepoint(); text input with a
+    // different keyboard layout can use send-text instead.
+    const unshifted = key.codepoint() orelse 0;
+    var text: [4]u8 = undefined;
+    const codepoint: u21 = if (mods.shift) shiftedCodepoint(unshifted) else unshifted;
+    const text_len = if (action != .release and codepoint >= 0x20)
+        std.unicode.utf8Encode(codepoint, &text) catch 0
+    else
+        0;
+
     // Create key event
     const event: input.KeyEvent = .{
         .action = action,
         .key = key,
         .mods = mods,
-        .consumed_mods = .{},
+        .consumed_mods = .{ .shift = mods.shift and text_len > 0 },
         .composing = false,
-        .utf8 = "",
-        .unshifted_codepoint = 0,
+        .utf8 = text[0..text_len],
+        .unshifted_codepoint = unshifted,
     };
 
     // Send key event
@@ -572,6 +593,25 @@ pub fn sendKey(
     };
 
     return ipc.success();
+}
+
+fn shiftedCodepoint(codepoint: u21) u21 {
+    return switch (codepoint) {
+        'a'...'z' => codepoint - 'a' + 'A',
+        '0'...'9' => ")!@#$%^&*("[codepoint - '0'],
+        ';' => ':',
+        '\'' => '"',
+        ',' => '<',
+        '`' => '~',
+        '.' => '>',
+        '/' => '?',
+        '-' => '_',
+        '=' => '+',
+        '[' => '{',
+        ']' => '}',
+        '\\' => '|',
+        else => codepoint,
+    };
 }
 
 /// Parse modifier string to Mods struct.
