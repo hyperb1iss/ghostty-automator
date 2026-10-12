@@ -66,7 +66,7 @@ BUILD_DIR="$(cd -- "$BUILD_DIR" && pwd)"
 [[ -f "$SKILLS_SOURCE/ghostty-terminal-automation/SKILL.md" ]] || error "Missing agent skill in $SKILLS_SOURCE"
 case "$PLATFORM" in
     macos-*)
-        [[ -x "$BUILD_DIR/Ghostty.app/Contents/MacOS/Ghostty" ]] || error "Missing macOS app executable in $BUILD_DIR/Ghostty.app"
+        [[ -x "$BUILD_DIR/Ghostty.app/Contents/MacOS/ghostty" ]] || error "Missing macOS app executable in $BUILD_DIR/Ghostty.app"
         [[ -d "$BUILD_DIR/Ghostty.app/Contents/Resources" ]] || error "Missing macOS app resources"
         require zip ;;
     linux-*)

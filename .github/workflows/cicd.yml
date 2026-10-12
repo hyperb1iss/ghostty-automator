@@ -226,7 +226,7 @@ jobs:
 
               def install
                 libexec.install buildpath.children
-                executable = OS.mac? ? libexec/"Ghostty.app/Contents/MacOS/Ghostty" : libexec/"bin/ghostty-automator"
+                executable = OS.mac? ? libexec/"Ghostty.app/Contents/MacOS/ghostty" : libexec/"bin/ghostty-automator"
                 resources = OS.mac? ? "unset GHOSTTY_RESOURCES_DIR" : "export GHOSTTY_RESOURCES_DIR=\"#{libexec}/share/ghostty\""
                 libraries = OS.mac? ? "" : "export LD_LIBRARY_PATH=\"#{libexec}/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}\""
                 (bin/"ghostty-automator").write <<~EOS
@@ -271,7 +271,9 @@ jobs:
           contents = File.read('ghostty-automator.rb')
           result, errors, status = Open3.capture3('gh', 'api', endpoint)
           payload = {
-            message: "Update ghostty-automator to #{ENV.fetch('RELEASE_TAG')}",
+            message: "fix(homebrew): update ghostty-automator to #{ENV.fetch('RELEASE_TAG')}\n\n" \
+                     "Publish the complete app, runtime data, and agent skill archives.\n" \
+                     "Keep the formula aligned with the release version and checksums.",
             content: Base64.strict_encode64(contents),
           }
           if status.success?

@@ -185,29 +185,51 @@ MAIN
     printf 'PASS: relocated ELF loads transitive shared libraries and preserves inherited search paths\n'
 fi
 
-# The macOS CLI must execute inside its app bundle, with framework links intact.
+# The macOS executable name is lowercase, including on case-sensitive volumes.
 mkdir -p "$SANDBOX/build/Ghostty.app/Contents/MacOS" \
     "$SANDBOX/build/Ghostty.app/Contents/Resources" \
     "$SANDBOX/build/Ghostty.app/Contents/Frameworks/Fixture.framework/Versions/A"
-cp "$SANDBOX/build/bin/ghostty-automator" "$SANDBOX/build/Ghostty.app/Contents/MacOS/Ghostty"
+cat > "$SANDBOX/build/Ghostty.app/Contents/MacOS/ghostty" <<'MAC_BINARY'
+#!/usr/bin/env bash
+[[ "${BASH_SOURCE[0]}" = */Contents/MacOS/ghostty ]] || {
+    printf 'Unexpected app executable path: %s\n' "${BASH_SOURCE[0]}" >&2
+    exit 1
+}
+printf 'fixture-version-2|%s|%s\n' "$*" "${GHOSTTY_RESOURCES_DIR:-}"
+MAC_BINARY
+chmod +x "$SANDBOX/build/Ghostty.app/Contents/MacOS/ghostty"
+cat > "$SANDBOX/build/Ghostty.app/Contents/Info.plist" <<'PLIST'
+<?xml version="1.0" encoding="UTF-8"?>
+<plist version="1.0">
+<dict>
+    <key>CFBundleExecutable</key>
+    <string>ghostty</string>
+</dict>
+</plist>
+PLIST
 printf 'framework\n' > "$SANDBOX/build/Ghostty.app/Contents/Frameworks/Fixture.framework/Versions/A/Fixture"
 ln -s A "$SANDBOX/build/Ghostty.app/Contents/Frameworks/Fixture.framework/Versions/Current"
 ln -s Versions/Current/Fixture "$SANDBOX/build/Ghostty.app/Contents/Frameworks/Fixture.framework/Fixture"
 package --platform macos-arm64
 export TEST_OS=Darwin TEST_ARCH=arm64
 MAC_ARCHIVE="$SANDBOX/archives/ghostty-automator-macos-arm64.zip"
+MAC_EXECUTABLE_ENTRIES="$(unzip -Z1 "$MAC_ARCHIVE" | sed -n '\|/Contents/MacOS/[^/][^/]*$|p')"
+[[ "$MAC_EXECUTABLE_ENTRIES" = 'ghostty-automator-macos-arm64/Ghostty.app/Contents/MacOS/ghostty' ]] \
+    || fail "incorrect case-sensitive macOS archive executable: $MAC_EXECUTABLE_ENTRIES"
+assert_contains "$(unzip -p "$MAC_ARCHIVE" 'ghostty-automator-macos-arm64/Ghostty.app/Contents/Info.plist')" \
+    '<string>ghostty</string>'
 mkdir -p "$TEST_HOME/Applications/Ghostty.app"
 printf 'stock app\n' > "$TEST_HOME/Applications/Ghostty.app/stock"
 run_install --archive "$MAC_ARCHIVE"
-assert_file "$APP_DIR/Contents/MacOS/Ghostty"
+assert_file "$APP_DIR/Contents/MacOS/ghostty"
 [[ -L "$APP_DIR/Contents/Frameworks/Fixture.framework/Fixture" ]] || fail 'framework link lost in package'
 [[ "$(cat "$TEST_HOME/Applications/Ghostty.app/stock")" = 'stock app' ]] || fail 'stock app changed'
 assert_contains "$(GHOSTTY_RESOURCES_DIR=/stock/resources "$INSTALL_DIR/bin/ghostty-automator" +version)" \
     'fixture-version-2|+version|'
 [[ "$(head -n 1 "$INSTALL_DIR/bin/ghostty-automator")" = '#!/usr/bin/env bash' ]] || fail 'CLI was copied out of app bundle'
 run_install --archive "$MAC_ARCHIVE"
-assert_file "$APP_DIR/Contents/MacOS/Ghostty"
-printf 'PASS: macOS app-backed CLI, framework links, repeat install, stock app preservation\n'
+assert_file "$APP_DIR/Contents/MacOS/ghostty"
+printf 'PASS: macOS lowercase executable, app-backed CLI, framework links, repeat install, stock app preservation\n'
 
 # Repacking must discard stale entries rather than updating an existing zip in place.
 printf 'stale resource\n' > "$SANDBOX/build/Ghostty.app/Contents/Resources/stale"
@@ -224,7 +246,7 @@ cp -R "$SANDBOX/build/Ghostty.app" "$SANDBOX/flat-mac/"
 cp -R "$SANDBOX/skills" "$SANDBOX/flat-mac/skills"
 (cd "$SANDBOX/flat-mac" && zip -qr --symlinks "$SANDBOX/flat-mac.zip" .)
 run_install --archive "$SANDBOX/flat-mac.zip"
-assert_file "$APP_DIR/Contents/MacOS/Ghostty"
+assert_file "$APP_DIR/Contents/MacOS/ghostty"
 mkdir -p "$TEST_HOME/Applications/Unmanaged.app"
 expect_error 'Refusing to replace an unmanaged app' --archive "$MAC_ARCHIVE" \
     --app-dir "$TEST_HOME/Applications/Unmanaged.app"

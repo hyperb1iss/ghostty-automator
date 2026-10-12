@@ -184,8 +184,8 @@ extract_archive() {
 
 validate_payload() {
     if [[ "$OS" = macos ]]; then
-        [[ -x "$PAYLOAD/Ghostty.app/Contents/MacOS/Ghostty" ]] \
-            || error "Missing app executable: Ghostty.app/Contents/MacOS/Ghostty"
+        [[ -x "$PAYLOAD/Ghostty.app/Contents/MacOS/ghostty" ]] \
+            || error "Missing app executable: Ghostty.app/Contents/MacOS/ghostty"
         [[ -d "$PAYLOAD/Ghostty.app/Contents/Resources" ]] || error "Missing app resources"
     else
         [[ -x "$PAYLOAD/bin/ghostty-automator" ]] || error "Missing executable: bin/ghostty-automator"
@@ -197,7 +197,7 @@ validate_payload() {
     fi
     local preflight_output
     if [[ "$OS" = macos ]]; then
-        if ! preflight_output="$(unset GHOSTTY_RESOURCES_DIR; "$PAYLOAD/Ghostty.app/Contents/MacOS/Ghostty" +help 2>&1)"; then
+        if ! preflight_output="$(unset GHOSTTY_RESOURCES_DIR; "$PAYLOAD/Ghostty.app/Contents/MacOS/ghostty" +help 2>&1)"; then
             error "The packaged executable cannot run; nothing installed: $preflight_output"
         fi
     else
@@ -237,7 +237,7 @@ install_payload() {
         fi
         printf '%s\n' 'ghostty-automator installer v1' > "$APP_DIR.$MARKER"
         rm -rf -- "$app_stage"
-        executable="$APP_DIR/Contents/MacOS/Ghostty"
+        executable="$APP_DIR/Contents/MacOS/ghostty"
     else
         cp -R "$PAYLOAD/bin" "$stage/bin"
         [[ ! -d "$PAYLOAD/lib" ]] || cp -R "$PAYLOAD/lib" "$stage/lib"

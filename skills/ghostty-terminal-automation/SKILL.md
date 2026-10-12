@@ -25,10 +25,10 @@ The installer defaults to `~/.local`, installs this skill under `~/.agents/skill
 and links it under `~/.claude/skills` when no separate Claude skill exists.
 Run `install.sh --help` for custom paths or local build/archive installation.
 
-Check `ghostty-automator +help` after locating or installing the binary. The
-published release (`v1.3.1-auto.1`) predates doctor and bootstrap. If those
-actions are missing, install a current build with
-`bash install.sh --build-dir zig-out` from the checkout, or use a matching
+Check `ghostty-automator +help` after locating or installing the binary. Older
+releases such as `v1.3.1-auto.1` predate doctor and bootstrap. If those actions
+are missing, update with the installer above. You can also install a source build
+with `bash install.sh --build-dir zig-out` from the checkout or install a matching
 local archive. The [repository README](https://github.com/hyperb1iss/ghostty-automator#build-and-package)
 has build instructions. Do not retry an unknown action or infer that its
 failure means the terminal is unreachable.
