@@ -115,7 +115,9 @@ fn remaining(timer: *std.time.Timer, timeout_ms: u32) !u32 {
 
 fn pause(timer: *std.time.Timer, timeout_ms: u32) !void {
     const ms = @min(50, try remaining(timer, timeout_ms));
-    _ = try posix.poll(&.{}, @intCast(ms));
+    // Empty Zig slices can carry poison pointers that older kernels reject,
+    // even when poll receives zero file descriptors.
+    std.Thread.sleep(@as(u64, ms) * std.time.ns_per_ms);
 }
 
 fn discover(alloc: Allocator, options: Options, timer: *std.time.Timer) !agent.Probe {
