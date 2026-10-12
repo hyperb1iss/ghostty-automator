@@ -266,6 +266,7 @@ install_payload() {
             printf '%s\n' 'unset GHOSTTY_RESOURCES_DIR'
         fi
         printf 'export GHOSTTY_AUTOMATOR_SKILLS_DIR=%q\n' "$runtime/skills"
+        printf 'export GHOSTTY_AUTOMATOR_LAUNCHER=%q\n' "$INSTALL_DIR/bin/ghostty-automator"
         printf 'exec %q "$@"\n' "$executable"
     } > "$launcher"
     chmod 755 "$launcher"

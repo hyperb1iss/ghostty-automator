@@ -149,6 +149,7 @@ jobs:
                   #{resources}
                   #{libraries}
                   export GHOSTTY_AUTOMATOR_SKILLS_DIR="#{libexec}/skills"
+                  export GHOSTTY_AUTOMATOR_LAUNCHER="#{bin}/ghostty-automator"
                   exec "#{executable}" "$@"
                 EOS
                 (bin/"ghostty-automator").chmod 0755
