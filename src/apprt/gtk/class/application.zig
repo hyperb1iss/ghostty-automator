@@ -434,10 +434,7 @@ pub const Application = extern struct {
     pub fn deinit(self: *Self) void {
         const alloc = self.allocator();
         const priv: *Private = self.private();
-        if (priv.ipc_server) |server| {
-            priv.ipc_server = null;
-            server.deinit();
-        }
+        self.stopIpc();
         priv.config.unref();
         priv.winproto.deinit(alloc);
         priv.global_shortcuts.unref();
@@ -458,6 +455,52 @@ pub const Application = extern struct {
         priv.css_provider.unref();
         for (priv.custom_css_providers.items) |provider| provider.unref();
         priv.custom_css_providers.deinit(alloc);
+    }
+
+    fn stopIpc(self: *Self) void {
+        const priv = self.private();
+        if (priv.ipc_server) |server| {
+            priv.ipc_server = null;
+            server.stop();
+            self.releaseDbusName();
+            server.deinit();
+        } else {
+            self.releaseDbusName();
+        }
+    }
+
+    /// Our custom run loop does not perform GApplication.run's D-Bus cleanup.
+    /// Release the application name before waiting for completed IPC writers,
+    /// so a replacement instance cannot be routed to the stopped main loop.
+    fn releaseDbusName(self: *Self) void {
+        const app = self.as(gio.Application);
+        if (app.getIsRegistered() == 0 or app.getIsRemote() != 0) return;
+        if (app.getFlags().non_unique) return;
+        const connection = app.getDbusConnection() orelse return;
+        const name = app.getApplicationId() orelse return;
+        const children = [_]*glib.Variant{glib.Variant.newString(name)};
+        const parameters = glib.Variant.newTuple(&children, children.len);
+        const reply_type = glib.VariantType.new("(u)");
+        defer reply_type.free();
+
+        var err_: ?*glib.Error = null;
+        defer if (err_) |err| err.free();
+        const reply = connection.callSync(
+            "org.freedesktop.DBus",
+            "/org/freedesktop/DBus",
+            "org.freedesktop.DBus",
+            "ReleaseName",
+            parameters,
+            reply_type,
+            .{},
+            1000,
+            null,
+            &err_,
+        );
+        defer if (reply) |value| value.unref();
+        if (err_) |err| log.warn("error releasing application name: {s}", .{
+            err.f_message orelse "(unknown)",
+        });
     }
 
     /// The global allocator that all other classes should use by
@@ -1493,10 +1536,7 @@ pub const Application = extern struct {
             }
             priv.signal_source = null;
         }
-        if (priv.ipc_server) |server| {
-            server.deinit();
-            priv.ipc_server = null;
-        }
+        self.stopIpc();
 
         gobject.Object.virtual_methods.dispose.call(
             Class.parent,

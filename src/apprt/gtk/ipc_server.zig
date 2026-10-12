@@ -148,9 +148,14 @@ pub const Server = struct {
         return self;
     }
 
-    /// Stop the server and clean up.
-    pub fn deinit(self: *Server) void {
+    /// Withdraw the listener and cancel callbacks before draining responses.
+    /// Call on the GTK thread after its main loop stops.
+    pub fn stop(self: *Server) void {
         self.client_mutex.lock();
+        if (self.shutting_down) {
+            self.client_mutex.unlock();
+            return;
+        }
         self.shutting_down = true;
         var next = self.clients;
         while (next) |client| {
@@ -195,6 +200,11 @@ pub const Server = struct {
         posix.close(self.socket_fd);
         self.owner_lock.unlock();
         self.owner_lock.close();
+    }
+
+    /// Stop the server, drain completed responses, and free its memory.
+    pub fn deinit(self: *Server) void {
+        self.stop();
 
         self.client_mutex.lock();
         while (self.active_clients > 0) {

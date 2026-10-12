@@ -8,15 +8,19 @@ Run on Linux with dbus-run-session and xvfb-run using
 from __future__ import annotations
 
 import argparse
+import array
 import concurrent.futures
+import fcntl
 import json
 import os
+import shlex
 import signal
 import socket
 import struct
 import subprocess
 import sys
 import tempfile
+import termios
 import threading
 import time
 from pathlib import Path
@@ -294,6 +298,117 @@ def test_startup(binary: Path, directory: Path) -> None:
     )
 
 
+def test_shutdown_restart(binary: Path, directory: Path) -> None:
+    config = "scrollback-limit = 10000000\nconfirm-close-surface = false\n"
+    with Session(binary, directory / "writers", config=config) as session:
+        boot = session.query("bootstrap", "--command=bash --noprofile --norc")
+        session.surface = boot["data"]["surface_id"]
+        socket_path = Path(boot["data"]["socket_path"])
+        pids = session.own_pids()
+        assert len(pids) == 1, pids
+        old_pid = pids[0]
+        old_socket = socket_path.stat()
+
+        flood = session.directory / "flood.py"
+        flood.write_text(
+            "import sys\n"
+            "sys.stdout.write(('X' * 80 + '\\n') * 10000 + 'WRITER_READY\\n')\n"
+        )
+        session.send(f"{shlex.quote(sys.executable)} {shlex.quote(str(flood))}\\r")
+        session.wait_text("WRITER_READY")
+        full = session.query(
+            "get-screen",
+            f"--surface={session.surface}",
+            "--screen=screen",
+            "--format=json",
+        )
+        assert len(full["content"]) > 300_000, "fixture did not fill scrollback"
+
+        held: list[socket.socket] = []
+        try:
+            queued_sizes = []
+            for _ in range(12):
+                writer = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+                held.append(writer)
+                writer.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 1024)
+                writer.settimeout(2)
+                writer.connect(str(socket_path))
+                request = json.dumps(
+                    {
+                        "version": 1,
+                        "target": session.name,
+                        "action": {
+                            "get_screen": {
+                                "surface_id": session.surface,
+                                "screen": "screen",
+                            }
+                        },
+                    }
+                ).encode()
+                writer.sendall(struct.pack("<I", len(request)) + request)
+                prefix = writer.recv(4, socket.MSG_PEEK | socket.MSG_WAITALL)
+                assert len(prefix) == 4, prefix
+                response_size = struct.unpack("<I", prefix)[0]
+                assert response_size > 300_000, response_size
+                queued = array.array("i", [0])
+                deadline = time.monotonic() + 2
+                while time.monotonic() < deadline:
+                    fcntl.ioctl(writer, termios.FIONREAD, queued, True)
+                    if queued[0] > 4:
+                        break
+                    # Header and body use separate writes; observing just the
+                    # header does not establish response backpressure yet.
+                    time.sleep(0.01)
+                assert 4 < queued[0] < response_size, (queued[0], response_size)
+                queued_sizes.append(queued[0])
+            print(
+                f"PASS 12 stalled writers: {response_size} response bytes, "
+                f"{min(queued_sizes)} minimum queued bytes",
+                flush=True,
+            )
+
+            session.run("close-surface", f"--surface={session.surface}")
+            began = time.monotonic()
+            fresh = session.query("bootstrap", "--command=bash --noprofile --norc")
+            elapsed = time.monotonic() - began
+            assert elapsed < 3, (
+                f"restart waited for old response writers: {elapsed:.3f}s"
+            )
+            assert fresh["data"]["started"] is True
+            assert fresh["data"]["surface_id"] != session.surface
+            assert Path(fresh["data"]["socket_path"]) == socket_path
+            pids = session.own_pids()
+            assert old_pid in pids and len(pids) == 2, pids
+            new_pid = next(pid for pid in pids if pid != old_pid)
+            fresh_socket = socket_path.stat()
+            identity = (fresh_socket.st_dev, fresh_socket.st_ino)
+            assert identity != (old_socket.st_dev, old_socket.st_ino)
+            surfaces = session.surfaces()
+            assert len(fresh["data"]["windows"]) == 1 and len(surfaces) == 1
+            assert surfaces[0]["id"] == fresh["data"]["surface_id"]
+            session.surface = fresh["data"]["surface_id"]
+
+            # Keep the sockets open and unread so only the server's write
+            # deadlines can finish the old process's response drain.
+            deadline = time.monotonic() + 6
+            while old_pid in session.own_pids() and time.monotonic() < deadline:
+                time.sleep(0.01)
+            assert session.own_pids() == [new_pid], session.own_pids()
+            current_socket = socket_path.stat()
+            assert (current_socket.st_dev, current_socket.st_ino) == identity
+            assert session.query("doctor")["data"]["surface_id"] == session.surface
+            print(
+                f"PASS restart in {elapsed:.3f}s during writer drain; "
+                "old deadlines exit without removing the new socket",
+                flush=True,
+            )
+        finally:
+            for writer in held:
+                writer.close()
+        session.run("close-surface", f"--surface={session.surface}")
+        session.wait_stopped(socket_path)
+
+
 def test_session(session: Session) -> None:
     cold = session.run("doctor", success=False)
     assert cold.returncode != 0, "doctor unexpectedly found a fresh isolated session"
@@ -433,6 +548,7 @@ def main() -> None:
         session = Session(binary, root / "interactive")
         try:
             test_startup(binary, root)
+            test_shutdown_restart(binary, root)
             test_session(session)
         finally:
             session.cleanup()
