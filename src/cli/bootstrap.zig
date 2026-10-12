@@ -89,7 +89,7 @@ fn runArgs(gpa: Allocator, iter: anytype) !u8 {
     if (agent.validateSocketPath(data.socket_path)) |failure| return agent.printFailure(failure);
     var failure: ?agent.Failure = null;
     bootstrap(alloc, options, &timer, &data, &failure) catch |err| {
-        const detail: []const u8 = switch (err) {
+        const detail: []const u8 = switch (@as(anyerror, err)) {
             error.HandedOffToExistingInstance => "An existing application accepted startup but is unreachable through this socket. Check its class and runtime directory; bootstrap did not activate another window",
             error.ChildExitedWithoutStatus => "The Automator starter exited without a wait status and no reachable instance appeared",
             error.StartupTimedOut => "Automator did not provide an initialized terminal before --timeout-ms",
