@@ -15,6 +15,7 @@ pub fn init(b: *std.Build, cfg: *const Config, deps: *const SharedDeps) !Ghostty
     // This is the exe used to generate some build data.
     const build_data_exe = b.addExecutable(.{
         .name = "ghostty-build-data",
+        .use_llvm = true,
         .root_module = b.createModule(.{
             .root_source_file = b.path("src/main_build_data.zig"),
             .target = b.graph.host,

@@ -796,6 +796,7 @@ pub fn gtkNgDistResources(
         // Run our blueprint compiler across all of our blueprint files.
         const blueprint_exe = b.addExecutable(.{
             .name = "gtk_blueprint_compiler",
+            .use_llvm = true,
             .root_module = b.createModule(.{
                 .root_source_file = b.path("src/apprt/gtk/build/blueprint.zig"),
                 .target = b.graph.host,
