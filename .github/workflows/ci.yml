@@ -13,6 +13,8 @@ concurrency:
 
 env:
   ZIG_VERSION: "0.15.2"
+  BLUEPRINT_VERSION: "0.18.0"
+  BLUEPRINT_SHA256: "4142b9017151a347ccdc2907ac033b18508363476b44a76d0420b4af420bd866"
 
 jobs:
   packaging:
@@ -47,7 +49,24 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y libgtk-4-dev libadwaita-1-dev \
-            blueprint-compiler gettext libonig-dev pkg-config xvfb dbus-x11
+            gettext libonig-dev pkg-config xvfb dbus-x11 meson ninja-build python3-gi
+
+      # Ubuntu 24.04 ships Blueprint 0.12; source builds require at least 0.16.
+      - name: Install Blueprint compiler
+        run: |
+          blueprint_root="$RUNNER_TEMP/blueprint-compiler"
+          mkdir -p "$blueprint_root"
+          archive="blueprint-compiler-$BLUEPRINT_VERSION.tar.xz"
+          curl -fsSL "https://download.gnome.org/sources/blueprint-compiler/${BLUEPRINT_VERSION%.*}/$archive" \
+            -o "$blueprint_root/$archive"
+          printf '%s  %s\n' "$BLUEPRINT_SHA256" "$blueprint_root/$archive" | sha256sum -c -
+          tar xJf "$blueprint_root/$archive" -C "$blueprint_root"
+          printf "[binaries]\npython3 = '/usr/bin/python3'\n" > "$blueprint_root/python.ini"
+          meson setup "$blueprint_root/build" "$blueprint_root/blueprint-compiler-$BLUEPRINT_VERSION" \
+            --prefix "$blueprint_root/install" --native-file "$blueprint_root/python.ini" -Ddocs=false
+          meson install -C "$blueprint_root/build"
+          printf '%s\n' "$blueprint_root/install/bin" >> "$GITHUB_PATH"
+          "$blueprint_root/install/bin/blueprint-compiler" --version
 
       - uses: astral-sh/setup-uv@1c37ad07a6a961277cf70c0d37d6f313000f5884 # v10.3.0
 
@@ -67,6 +86,13 @@ jobs:
     timeout-minutes: 60
     steps:
       - uses: actions/checkout@v6
+
+      # Zig 0.15.2 cannot resolve arm64 libc symbols in newer Apple SDKs.
+      - name: Select Xcode 26.2
+        run: |
+          sudo xcode-select -s /Applications/Xcode_26.2.app
+          xcodebuild -version
+          xcrun --sdk macosx --show-sdk-path
 
       - name: Install Zig
         uses: mlugg/setup-zig@v2.2.1
